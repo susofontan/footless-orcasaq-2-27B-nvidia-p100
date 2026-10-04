@@ -1,3 +1,5 @@
+![Project banner](assets/banner_orca_p100.jpeg)
+
 # OrcaSAQ-2-27B on a Tesla P100 — footless in Docker
 
 Run **[OrcaSAQ2 27B](https://huggingface.co/orcarouter/OrcaSAQ-2-27B)** on a
@@ -24,14 +26,6 @@ On a P100 you get:
 > server answers one request at a time, with no batching. Expect rough edges, and
 > do not use it where a failure would be costly.
 
-The image holds code only: the engine, the model runtime and the precompiled
-kernels. On first start the container downloads the weights from Hugging Face
-into a folder on the host. It then adds the runtime next to them, as
-`models/OrcaSAQ-2-27B/footless/`, and serves:
-
-```
-python3 -m footless serve --model ./models/OrcaSAQ-2-27B/ --mtp --host 0.0.0.0 --port 8080
-```
 
 **Contents:** [Prerequisites](#prerequisites) ·
 [Setup and first start](#setup-and-first-start) · [Endpoints](#endpoints) ·
