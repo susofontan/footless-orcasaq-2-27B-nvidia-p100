@@ -1,0 +1,17 @@
+# local settings (may hold HF_TOKEN / API_KEY)
+.env
+
+# downloaded model weights
+models/*
+!models/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

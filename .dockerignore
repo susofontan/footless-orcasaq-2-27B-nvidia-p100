@@ -1,0 +1,9 @@
+models/
+.env
+.env.*
+!.env.example
+.git/
+**/__pycache__/
+*.md
+check-host.sh
+assets/

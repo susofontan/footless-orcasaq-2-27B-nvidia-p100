@@ -1,0 +1,4 @@
+# Runtime: numpy for the sampler. Download: the Hugging Face client (+ Xet transfers).
+numpy==2.5.3
+huggingface_hub==1.33.0
+hf-xet==1.6.0

@@ -1,0 +1,30 @@
+# What the engine must know before any model code runs (CONTRACT.md § Manifest).
+# cache_bytes_per_token is the growing full-attention KV only, in the format
+# [runtime] kv_cache names below (16 layers x k|v x 1088 B in int8, 2048 B in
+# fp16); the fixed GDN state is claimed at new_state. Both from
+# cuda_sm60/_build/DESIGN.md and _reference/ARCHITECTURE.md § "States and
+# cache bytes".
+name = "OrcaSAQ-2-27B"
+backends = ["cuda_sm60"]
+max_batch = 1
+max_context = 102400
+cache_bytes_per_token = 34816
+# `label_logprobs` is the optional verb behind the decision routes
+# (CONTRACT.md § Optional verbs, PLAN_DECISIONS.md §4.1): label log-probs at
+# the answer position, one prefill, no sampling. cuda_sm60/runtime.py must
+# report the same list in its Facts; a disagreement is a hard error.
+# `tool_calls`: function tools rendered by the template, calls read back by the
+# runtime's verb of the same name (tokenizer.tool_calls).
+capabilities = ["speculative", "label_logprobs", "tool_calls"]
+# Reasoning levels the runtime accepts. The engine checks this against
+# Facts.thinking_levels and a disagreement is a hard error (CONTRACT.md rule 3).
+# `medium` is the level with no instructions attached; see tokenizer.py.
+thinking_levels = ["xhigh", "medium", "low"]
+
+# Read by cuda_sm60/runtime.py at open; the engine only checks it is a table.
+[runtime]
+# The full-attention KV cache: "int8" (per-32-value fp16 scales; ~100k tokens
+# fit, quality equal to fp16 within measurement noise) or "fp16" (~58k fit).
+# Changing it changes cache_bytes_per_token above: 34816 for "int8", 65536 for
+# "fp16" -- the runtime refuses a pair that disagrees.
+kv_cache = "int8"
