@@ -6,7 +6,9 @@
 # cache bytes".
 name = "OrcaSAQ-2-27B"
 backends = ["cuda_sm60"]
-max_batch = 1
+# Sequences one step carries: their decode rows share one forward
+# (cuda_sm60/runtime.py, MAX_BATCH and `_step_rows`).
+max_batch = 4
 max_context = 102400
 cache_bytes_per_token = 34816
 # `label_logprobs` is the optional verb behind the decision routes

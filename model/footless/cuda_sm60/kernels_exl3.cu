@@ -3814,6 +3814,18 @@ EXL3_AFP_ENTRY(exl3_gemv_w4a3fp, EXL3_GEMV_OCC,
                EXL3_AF_VARI(if (m == 3 && ntok == 3) EXL3_AFP_CALL(3, V_, true);))
 EXL3_AFP_ENTRY(exl3_gemv_w4a3fp3, 3,
                EXL3_AF_VARI(if (m == 3 && ntok == 3) EXL3_AFP_CALL(3, V_, true);))
+// m = 2 and m = 4 alone: a batched decode's rows (the runtime's _step_rows, two or
+// four sequences a step) as one full group, where the m-general entry carried
+// every group's code and ran m = 4 as a partial group. Same arithmetic, so the
+// same bits.
+EXL3_AFP_ENTRY(exl3_gemv_w4a2fp, EXL3_GEMV_OCC,
+               EXL3_AF_VARI(if (m == 2 && ntok == 2) EXL3_AFP_CALL(2, V_, true);))
+EXL3_AFP_ENTRY(exl3_gemv_w4a4fp, EXL3_GEMV_OCC,
+               EXL3_AF_VARI(if (m == 4 && ntok == 4) EXL3_AFP_CALL(4, V_, true);))
+EXL3_AFP_ENTRY(exl3_gemv_w4a2fp3, 3,
+               EXL3_AF_VARI(if (m == 2 && ntok == 2) EXL3_AFP_CALL(2, V_, true);))
+EXL3_AFP_ENTRY(exl3_gemv_w4a4fp3, 3,
+               EXL3_AF_VARI(if (m == 4 && ntok == 4) EXL3_AFP_CALL(4, V_, true);))
 
 // ============================================================================
 // SEVERAL PROJECTIONS OF ONE INPUT IN ONE LAUNCH (exl3_gemv_w4a1fpn / w4a3fpn)
@@ -3991,4 +4003,25 @@ extern "C" __global__ void __launch_bounds__(EXL3_THREADS, EXL3_GEMV_OCC)
 exl3_gemv_w4a3fpn(const half* __restrict__ xin, int in, int nmod, Exl3Fm m0, Exl3Fm m1,
                   Exl3Fm m2, Exl3Ab ab) {
     exl3_gemv_fpn_body<3>(xin, in, nmod, m0, m1, m2, ab);
+}
+// ... and the batched decode's groups of 2 and 4 rows
+extern "C" __global__ void __launch_bounds__(EXL3_THREADS, EXL3_GEMV_OCC)
+exl3_gemv_w4a2fpn(const half* __restrict__ xin, int in, int nmod, Exl3Fm m0, Exl3Fm m1,
+                  Exl3Fm m2, Exl3Ab ab) {
+    exl3_gemv_fpn_body<2>(xin, in, nmod, m0, m1, m2, ab);
+}
+extern "C" __global__ void __launch_bounds__(EXL3_THREADS, EXL3_GEMV_OCC)
+exl3_gemv_w4a4fpn(const half* __restrict__ xin, int in, int nmod, Exl3Fm m0, Exl3Fm m1,
+                  Exl3Fm m2, Exl3Ab ab) {
+    exl3_gemv_fpn_body<4>(xin, in, nmod, m0, m1, m2, ab);
+}
+extern "C" __global__ void __launch_bounds__(EXL3_THREADS, 3)
+exl3_gemv_w4a2fpn3(const half* __restrict__ xin, int in, int nmod, Exl3Fm m0, Exl3Fm m1,
+                   Exl3Fm m2, Exl3Ab ab) {
+    exl3_gemv_fpn_body<2>(xin, in, nmod, m0, m1, m2, ab);
+}
+extern "C" __global__ void __launch_bounds__(EXL3_THREADS, 3)
+exl3_gemv_w4a4fpn3(const half* __restrict__ xin, int in, int nmod, Exl3Fm m0, Exl3Fm m1,
+                   Exl3Fm m2, Exl3Ab ab) {
+    exl3_gemv_fpn_body<4>(xin, in, nmod, m0, m1, m2, ab);
 }

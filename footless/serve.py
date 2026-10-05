@@ -9,9 +9,11 @@ decision routes POST /v1/decisions and POST /v1/systemone, which answer
 questions from label scores at the answer position, generate nothing, and
 never stream.
 
-Requests are served one at a time, in arrival order: the engine runs one step
-at a time and this adds no batching of its own. A disconnected client cancels
-its request at the next step boundary.
+Requests run together: each is a task of the engine's `Batcher`, which
+admits them in arrival order up to the package's `max_batch` and runs one
+step over all of them at a time (`Engine.sequence`). Decision requests run
+between steps. A disconnected client cancels its request at the next step
+boundary.
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
 from . import decisions, wire
-from .engine import Engine
+from .engine import Batcher, Engine
 from .render import LogprobRow, Output, ToolCalls
 from .sdk import LABEL_LOGPROBS, BudgetRefused, ContractError, SamplingSpec
 
@@ -83,7 +85,7 @@ class _Usage:
 
 
 class FrontEnd:
-    """One loaded model behind the wire, one request at a time.
+    """One loaded model behind the wire, its requests batched together.
 
     The request loop runs on one thread only — the thread that opened the
     engine: a model runtime's device context belongs to the thread that
@@ -122,22 +124,42 @@ class FrontEnd:
     # -- the one thread that touches the engine ----------------------------
 
     def run(self) -> None:
+        """Take jobs as they come and step the ones running, until `close`.
+
+        Idle, it waits for a job; busy, it takes whatever arrived since the
+        last step and runs the next one. `close` lets the running jobs end."""
+        batcher = Batcher(self.engine)
+        closing = False
         while True:
-            job = self._queue.get()
-            if job is None:
-                return
-            try:
-                self._run(job)
-            except wire.ApiError as exc:
-                self._fail(job, exc.body(), exc.code)
-            except (BudgetRefused, ContractError) as exc:
-                self._log("error", f"{type(exc).__name__}: {exc}")
-                self._fail(job, wire.error(str(exc), 500, "InternalServerError"), 500)
-            except Exception as exc:  # noqa: BLE001 - one request never kills the server
-                self._log("error", f"{type(exc).__name__}: {exc}")
-                self._fail(job,
-                           wire.error(f"{type(exc).__name__}: {exc}", 500,
-                                      "InternalServerError"), 500)
+            while not closing:
+                try:
+                    job = self._queue.get(block=not batcher.busy())
+                except queue.Empty:
+                    break
+                if job is None:
+                    closing = True
+                else:
+                    batcher.add(self._task(job))
+            if not batcher.busy():
+                if closing:
+                    return
+                continue
+            batcher.step()
+
+    def _task(self, job: _Job):
+        """One job as a Batcher task: its failure is its own client's error."""
+        try:
+            yield from self._run(job)
+        except wire.ApiError as exc:
+            self._fail(job, exc.body(), exc.code)
+        except (BudgetRefused, ContractError) as exc:
+            self._log("error", f"{type(exc).__name__}: {exc}")
+            self._fail(job, wire.error(str(exc), 500, "InternalServerError"), 500)
+        except Exception as exc:  # noqa: BLE001 - one request never kills the server
+            self._log("error", f"{type(exc).__name__}: {exc}")
+            self._fail(job,
+                       wire.error(f"{type(exc).__name__}: {exc}", 500,
+                                  "InternalServerError"), 500)
 
     @staticmethod
     def _fail(job: _Job, body: dict, code: int) -> None:
@@ -145,7 +167,9 @@ class FrontEnd:
         # [...]} shape, every other failure the {"error": {...}} envelope
         job.push("error", (body, code))
 
-    def _run(self, job: _Job) -> None:
+    def _run(self, job: _Job):
+        """The job's generations, as a generator the Batcher drives (a
+        decision request runs at once and yields nothing)."""
         request = job.request
         if isinstance(request, (wire.DecisionsRequest, wire.SystemOneRequest)):
             return self._run_decisions(job, request)
@@ -173,7 +197,7 @@ class FrontEnd:
         for prompt_ids, echo in prompts:
             cached = 0
             for _ in range(request.n):
-                output, finish, got, rows, calls = self._one_choice(
+                output, finish, got, rows, calls = yield from self._one_choice(
                     job, request, prompt_ids, echo, spec, max_tokens, usage,
                     response_id, created, index,
                 )
@@ -248,7 +272,7 @@ class FrontEnd:
                 stream.delta(pieces, fresh)
             return stop
 
-        result = self.engine.generate_tokens(
+        result = yield from self.engine.sequence(
             prompt_ids, max_tokens, sampling=spec, on_step=on_step, ctx=job.ctx,
         )
         pieces, fresh = output.close()

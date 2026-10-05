@@ -130,7 +130,15 @@ def _kv_row(kv8: bool | None = None) -> int:
 
 
 CACHE_BYTES_PER_TOKEN = 16 * 2 * _kv_row()  # 16 full-attn layers, k and v: 34816 (fp16: 65536)
-MAX_BATCH = 1
+# Sequences one step may carry. Their decode rows share ONE forward (`_step_rows`):
+# the weights are read once for all of them, the decode GEMV is ALU-bound per
+# weight and not per row, so 4 rows cost far less than 4 forwards. 4 is the
+# token group the wide GEMV takes in one pass (5..7 take two) and the head's
+# logit rows (LOGIT_ROWS).
+MAX_BATCH = 4
+# ORCA_BATCH=0 forwards each item of a batch on its own (the A/B and the
+# reference the batched rows are checked against)
+BATCH = int(__import__("os").environ.get("ORCA_BATCH", "1"))
 # what one sequence fits in int8 KV (speculation on: ~77k, see log); in fp16 the
 # budget refuses past ~58k (~50k speculating) before this does
 MAX_CONTEXT = 102400
@@ -584,6 +592,7 @@ class CudaRuntime:
         self.mtp_accept2 = 0     # rounds that accepted both drafts (MTP_K = 2)
         self.verify_tag = 0      # bumps on every verify forward (snap_s owner)
         self.segs = None         # (start, len) per sequence of a segmented forward
+        self.bsegs = None        # (state, pos0) per row of a batched decode forward
         self.lab_s = self.lab_conv = None   # its scratch (label_logprobs_batch)
         # Speculation is OFF until the engine asks (CONTRACT.md, optional
         # verbs). `split_max` is how many of the MTP_SPLIT_MAX buffer rows are
@@ -1722,17 +1731,130 @@ class CudaRuntime:
 
         if len(batch) > MAX_BATCH:
             raise ContractError(f"batch of {len(batch)} exceeds max_batch {MAX_BATCH}")
-        out = []
-        for item in batch:
-            if ctx.cancelled():
-                out.append(StepResult(None, True))
-                continue
-            out.append(self._step_one(item))
+        if len({id(item.state) for item in batch}) != len(batch):
+            raise ContractError("a state appears more than once in one batch")
+        # Decode rows (one pending token each) share one forward; everything
+        # else -- a prefill chunk, a replay, a token a speculative round already
+        # verified -- goes through `_step_one` on its own. A lone decode row
+        # does too: it is the single-sequence path, speculation included.
+        # Every state's room first: a refused claim (BudgetRefused) then leaves
+        # every item as it was, and the engine may run the step again without
+        # one of them. Positions past what a forward needs (a speculative round
+        # takes up to 3 more) only move a growth a few tokens earlier.
+        cancelled = ctx.cancelled()
+        if not cancelled:
+            for item in batch:
+                need = self._need(item)
+                if need:
+                    self._grow(item.state, need)
+        out = [None] * len(batch)
+        rows = []
+        for k, item in enumerate(batch):
+            if cancelled or ctx.cancelled():
+                out[k] = StepResult(None, True)
+            elif self._joins_rows(item):
+                rows.append(k)
+            else:
+                out[k] = self._step_one(item)
+        if len(rows) == 1:
+            out[rows[0]] = self._step_one(batch[rows[0]])
+        elif rows:
+            for k, result in zip(rows, self._step_rows([batch[k] for k in rows])):
+                out[k] = result
         # step() is synchronous to its caller: the engine times it as one, and
         # an undrained queue reports the host's enqueue rate (209 t/s here
         # against 105.6 real)
         self.dev.sync()
         return out
+
+    def _need(self, item) -> int:
+        """The positions `item`'s state must hold for this step, or 0 when it
+        forwards nothing (or asks past max_context, which `_step_one` refuses).
+        Replayed ids are already in `tokens`; the pending token is not."""
+        state = item.state
+        if state.s is None or (self.mtp_on and state.mtp.out and not item.input_tokens):
+            return 0
+        n = len(state.tokens) + (state.pending is not None) + len(item.input_tokens)
+        if n == len(state.tokens) or n > MAX_CONTEXT:
+            return 0
+        if self.mtp_on and item.sampling is not None:
+            n = min(n + 3, MAX_CONTEXT)
+        return n
+
+    def _joins_rows(self, item) -> bool:
+        """Is `item` one decode row of a batched forward (`_step_rows`)?"""
+        state = item.state
+        return bool(BATCH and ATT_PREP and ATT_DEC and KV8 and GDN_FUSED and GDN_ROWS_F
+                    and GDN_CONV_F and state.s is not None and item.sampling is not None
+                    and not item.input_tokens and state.pending is not None
+                    and not state.replay and not (self.mtp_on and state.mtp.out)
+                    and len(state.tokens) + 1 <= MAX_CONTEXT)
+
+    def _step_rows(self, items):
+        """One token for each of several sequences, from ONE forward of their
+        pending tokens: row r is sequence r at its own position, over its own
+        state (`bsegs`).
+
+        Every projection and norm runs over all the rows in one pass over the
+        weights, at the T = 1 k-split (`shape_T=1`, as the speculative verify
+        does), so each row's partials are the single-sequence decode's in the
+        same order; the conv, the GDN scan and the attention are the decode's
+        launches, one per row, on that row's state. Row r is therefore the
+        forward `_step_one` would have run for sequence r alone -- and it is
+        sampled, booked and handed back exactly as there.
+
+        Batched rows do not speculate. With speculation on, each sequence's
+        drafter still takes its row (`_mtp_keep`), so a sequence that is left
+        alone drafts again from its next step.
+        """
+        from footless.sdk import StepResult
+
+        states = [item.state for item in items]
+        pos = [len(state.tokens) for state in states]
+        for state, p in zip(states, pos):
+            self._grow(state, p + 1)    # every refusal before anything moves
+        tokens = [state.pending for state in states]
+        self.bsegs = list(zip(states, pos))
+        try:
+            logits = self._forward(None, tokens, 0, want_logits=True, all_rows=True,
+                                   shape_T=1)
+        finally:
+            self.bsegs = None
+        if self.mtp_on:
+            n = len(items) * HIDDEN * 2
+            self.dev.dtod(self._view(self._p("hkeep"), n), self._view(self._p("h"), n), n)
+        out = []
+        for r, (item, state) in enumerate(zip(items, states)):
+            state.phase ^= 1
+            self.dev.dtod(state.logits, self._view(logits.ptr + r * VOCAB * 2, VOCAB * 2),
+                          VOCAB * 2)
+            state.has_logits = True
+            state.tokens = state.tokens + [tokens[r]]
+            state.pending = None
+            if self.mtp_on:
+                state.mtp.spec = item.sampling
+            token = self._sample(state.logits, item.sampling, *self._pen_ctx(state))
+            state.pending = token
+            out.append(StepResult(token, token in STOP_TOKENS, forwarded_tokens=1))
+        if self.mtp_on:
+            for r, state in enumerate(states):
+                self._mtp_keep(state, pos[r], r, out[r].token)
+        return out
+
+    def _mtp_keep(self, state, pos0: int, r: int, token: int) -> None:
+        """A batched row's drafter bookkeeping: no draft (the row did not
+        speculate), but the drafter's own row at `pos0` -- the target's hidden
+        there (`hkeep` row r) and the token after it -- so its cache stays
+        whole and the sequence drafts again once it runs alone. A cache that
+        is already behind (`mtp_len < pos0`) is left so; it costs speed, never
+        tokens."""
+        m = state.mtp
+        m.draft = m.draft2 = None
+        if m.mtp_len < pos0 or m.cap < pos0 + 1:
+            return
+        hk = self._p("hkeep")
+        self.dev.dtod(m.hprev, self._view(hk + r * HIDDEN * 2, HIDDEN * 2), HIDDEN * 2)
+        self._mtp_forward(state, [token], pos0, hk, r, 1)
 
     def _step_one(self, item):
         from footless.sdk import ContractError, StepResult
@@ -1956,7 +2078,7 @@ class CudaRuntime:
         if m.draft2 is not None and pos0 + 3 <= MAX_CONTEXT and m.cap >= pos0 + 3:
             return self._mtp_round2(state, item, inputs, pos0, fed_add)
         d = m.draft
-        rng = self._rng(spec.seed)
+        rng = self._rng(spec)
         st0 = rng.getstate()
         row = self._forward(state, [inputs[0], d], pos0, want_logits=True,
                             all_rows=True, shape_T=MTP_SHAPE_T1, verify=True)
@@ -2040,7 +2162,7 @@ class CudaRuntime:
         spec = item.sampling
         p, d1, d2 = inputs[0], m.draft, m.draft2
         self._grow(state, pos0 + 4)
-        rng = self._rng(spec.seed)
+        rng = self._rng(spec)
         st0 = rng.getstate()
         row = self._forward(state, [p, d1, d2], pos0, want_logits=True,
                             all_rows=True, shape_T=MTP_SHAPE_T1, verify=True)
@@ -2257,6 +2379,9 @@ class CudaRuntime:
                     name = "exl3_gemv_w4a1fp" if m == 1 else "exl3_gemv_w4afp"
                     if m == 3 and T == 3 and M3_ENTRY:
                         name = "exl3_gemv_w4a3fp3" if in_dim >= M3_OCC3_MIN_IN else "exl3_gemv_w4a3fp"
+                    elif m in (2, 4) and T == m and ROWS_ENTRY:
+                        name = f"exl3_gemv_w4a{m}fp" + \
+                            ("3" if in_dim >= ROWS_OCC3_MIN_IN[m] else "")
                     self._launch(self.kx[name],
                                  (bx, ty, s), (256,),
                                  [x_ptr, x_up, self.ptr(module + ".suh"),
@@ -2354,8 +2479,8 @@ class CudaRuntime:
         each. `ab` = (wa, wb, ya, yb, out): gemv_ab_f32's rows ride in the same
         launch; returns whether they did."""
         fm = []
-        if (T == 1 or (T == 3 and M3_ENTRY)) and GEMV_N and EXL3_FUSED_PRE and EXL3_AFFINE \
-                and EXL3_FUSED_POST:
+        if (T == 1 or (T == 3 and M3_ENTRY) or (T in (2, 4) and ROWS_ENTRY)) and GEMV_N \
+                and EXL3_FUSED_PRE and EXL3_AFFINE and EXL3_FUSED_POST:
             in0 = self._dims(items[0][0])[0]
             pt, cnt, kmax = 0, 0, 0
             for module, out_ptr in items:
@@ -2375,7 +2500,7 @@ class CudaRuntime:
                 pt += s * T * out_dim * 4
                 cnt += bx
                 kmax = max(kmax, -(-(in_dim // 16) // s))
-            if pt > EXL3_PT_BYTES:
+            if pt > (self.w["pt"].nbytes if T in (2, 4) and ROWS_PT else EXL3_PT_BYTES):
                 fm = []
         if not fm:
             for module, out_ptr in items:
@@ -2383,7 +2508,7 @@ class CudaRuntime:
             return False
         nb = sum(-(-(f.out // 16) // 32) * f.S for f in fm)
         abs_ = _Exl3Ab(*ab) if ab is not None else _Exl3Ab(0, 0, 0, 0, 0)
-        self._launch(self.kx["exl3_gemv_w4a1fpn" if T == 1 else "exl3_gemv_w4a3fpn"],
+        self._launch(self.kx[f"exl3_gemv_w4a{T}fpn" + ("3" if T in ROWS_FPN_OCC3 else "")],
                      (nb + abs_.out * T,), (256,),
                      [x_ptr, in0, len(fm)] + fm + [fm[-1]] * (3 - len(fm)) + [abs_],
                      shared=T * kmax * 32)
@@ -2585,6 +2710,8 @@ class CudaRuntime:
             # pre-rotation, GEMV and post-rotation in one launch, one token group
             # (the same values as the three launches below: 0.94x their time)
             name = {1: "exl3_gemv_w4a1fp", 3: "exl3_gemv_w4a3fp"}.get(Tr, "exl3_gemv_w4afp")
+            if Tr in (2, 4) and ROWS_ENTRY:
+                name = f"exl3_gemv_w4a{Tr}fp"
             self._launch(self.kx[name], (VOCAB // 512, 1, 1), (256,),
                          [last, 0, self.ptr("lm_head.suh"), self.ptr("lm_head.trellis"),
                           self._p("pt"), self.ptr("lm_head.svh"), self._p("logits2"),
@@ -2654,6 +2781,9 @@ class CudaRuntime:
         p = f"{PREFIX}layers.{i}."
         a = p + "self_attn."
         ord_ = self.full_ord[i]
+        if self.bsegs is not None:
+            self._full_attn_rows(a, ord_, T, shape_T)
+            return
         kp, vp, lcap = self._kvl(state, ord_)
         self._gemv_many(self._p("h"), [(a + "q_proj", self._p("qg")), (a + "k_proj", self._p("k")),
                                         (a + "v_proj", self._p("v"))], T, shape_T)
@@ -2732,6 +2862,21 @@ class CudaRuntime:
                       2 * HEAD_DIM, HEAD_DIM])
         self._gemv(self._p("att"), a + "o_proj", self._p("p"), T, shape_T)
 
+    def _full_attn_rows(self, a: str, ord_: int, T: int, shape_T: int) -> None:
+        """`_full_attn` for a batched decode forward (`_step_rows`): the
+        projections over every row at once, then per row the decode block --
+        prep, attention and gated merge -- over that row's own cache."""
+        self._gemv_many(self._p("h"), [(a + "q_proj", self._p("qg")), (a + "k_proj", self._p("k")),
+                                        (a + "v_proj", self._p("v"))], T, shape_T)
+        qrow, krow, arow = N_HEADS * 2 * HEAD_DIM * 2, N_KV * HEAD_DIM * 2, N_HEADS * HEAD_DIM * 2
+        for r, (state, pos0) in enumerate(self.bsegs):
+            kp, vp, lcap = self._kvl(state, ord_)
+            qg = self._p("qg") + r * qrow
+            self._attn_prep(qg, a, kp, vp, pos0, lcap, 1,
+                            k=self._p("k") + r * krow, v=self._p("v") + r * krow)
+            self._attn_dec(qg, kp, vp, self._p("att") + r * arow, pos0, lcap, 1, gate=True)
+        self._gemv(self._p("att"), a + "o_proj", self._p("p"), T, shape_T)
+
     def _full_attn_segs(self, state, ord_: int, pos0: int) -> None:
         """`_full_attn`'s position-dependent half for a segmented forward
         (`label_logprobs_batch`): each segment is its own sequence continuing
@@ -2775,11 +2920,12 @@ class CudaRuntime:
                       DEC_TMIN, DEC_SMAX] + ([qg, 2 * HEAD_DIM, HEAD_DIM] if gate else []))
 
     def _attn_prep(self, qg: int, a: str, kp: int, vp: int, pos0: int, lcap: int,
-                   T: int) -> None:
+                   T: int, k: int = 0, v: int = 0) -> None:
         """q_norm, k_norm, rope and kv_store_q8 for T tokens as one launch
-        (kernels.cu's attn_prep_q8), `a` the attention module's prefix."""
+        (kernels.cu's attn_prep_q8), `a` the attention module's prefix; `k`,
+        `v` the rows' k and v (the arenas' first rows unless named)."""
         self._launch(self.k["attn_prep_q8"], (N_HEADS + N_KV, T), (HEAD_DIM,),
-                     [qg, self._p("k"), self._p("v"), self.ptr(a + "q_norm.weight"),
+                     [qg, k or self._p("k"), v or self._p("v"), self.ptr(a + "q_norm.weight"),
                       self.ptr(a + "k_norm.weight"), kp, vp, N_HEADS, N_KV, HEAD_DIM,
                       2 * HEAD_DIM, pos0, lcap, ROPE_DIM, self.rope_theta, NORM_EPS])
 
@@ -2817,6 +2963,9 @@ class CudaRuntime:
         p = f"{PREFIX}layers.{i}."
         a = p + "linear_attn."
         g = self.gdn_ord[i]
+        if self.bsegs is not None:
+            self._gdn_rows(a, g, T, shape_T)
+            return
         s_in = state.conv[state.phase]
         s_out = state.conv[state.phase ^ 1]
         # the two unquantized fp16 projections, fp32 out (`gdn_scalars` wants
@@ -2957,6 +3106,40 @@ class CudaRuntime:
                           self._p("y"), T, GDN_K_HEADS, GDN_V_HEADS, GDN_K, GDN_V,
                           QKV_ROWS, QKV_ROWS, GDN_V_HEADS * GDN_V, Q_SCALE, GDN_GROUP, ck,
                           GDN_S_BYTES // 4])
+        self._launch(self.k["rmsnorm_gated"], (GDN_V_HEADS, T), (128,),
+                     [self._p("y"), self._p("zn"), self.ptr(a + "norm.weight"),
+                      self._p("yn"), GDN_V, GDN_V_HEADS, GDN_V, GDN_NORM_EPS])
+        self._gemv(self._p("yn"), a + "out_proj", self._p("p"), T, shape_T)
+
+    def _gdn_rows(self, a: str, g: int, T: int, shape_T: int) -> None:
+        """`_gdn` for a batched decode forward (`_step_rows`): the projections
+        over every row at once, then per row the decode's fused conv + scan
+        (gdn_scan_rows_f) on that row's own recurrence and conv state, then
+        the gated norm and out_proj over every row again."""
+        ab = (self.ptr(a + "in_proj_a.weight"), self.ptr(a + "in_proj_b.weight"),
+              self._p("ab"), self._p("ab") + T * 48 * 4, 48) if GEMV_AB else None
+        if not self._gemv_many(self._p("h"), [(a + "in_proj_qkv", self._p("qkv")),
+                                              (a + "in_proj_z", self._p("zn"))], T, shape_T,
+                               ab=ab):
+            self._launch(self.kx["gemv_ab_f32"], (2 * 48, T), (128,),
+                         [self._p("h"), self.ptr(a + "in_proj_a.weight"),
+                          self.ptr(a + "in_proj_b.weight"), self._p("ab"),
+                          self._p("ab") + T * 48 * 4, HIDDEN, 48])
+        conv_w = self.ptr(a + "conv1d.weight")
+        base = g * 3 * QKV_ROWS * 2
+        layer_s = GDN_V_HEADS * GDN_V * GDN_K * 4
+        for r, (state, pos0) in enumerate(self.bsegs):
+            c = self._p("c") + r * QKV_ROWS * 2
+            self._launch(self.k["gdn_scan_rows_f"], (GDN_V_HEADS, GDN_V // 32), (256,),
+                         [c, c + 2048 * 2, c + 4096 * 2, state.s.ptr + g * layer_s,
+                          self._p("y") + r * GDN_V_HEADS * GDN_V * 2, 1, GDN_K_HEADS,
+                          GDN_V_HEADS, GDN_K, GDN_V, QKV_ROWS, QKV_ROWS, GDN_V_HEADS * GDN_V,
+                          Q_SCALE, GDN_GROUP, 0, GDN_S_BYTES // 4,
+                          self._p("ab") + r * 48 * 4, self._p("ab") + (T + r) * 48 * 4,
+                          self.ptr(a + "A_log"), self.ptr(a + "dt_bias"), 48, L2_EPS,
+                          self._p("qkv") + r * QKV_ROWS * 2, conv_w,
+                          state.conv[state.phase].ptr + base,
+                          state.conv[state.phase ^ 1].ptr + base, pos0])
         self._launch(self.k["rmsnorm_gated"], (GDN_V_HEADS, T), (128,),
                      [self._p("y"), self._p("zn"), self.ptr(a + "norm.weight"),
                       self._p("yn"), GDN_V, GDN_V_HEADS, GDN_V, GDN_NORM_EPS])
@@ -3571,7 +3754,7 @@ class CudaRuntime:
             if total > 0:
                 probs = probs / total
         if draw is None:
-            draw = self._rng(spec.seed).random()
+            draw = self._rng(spec).random()
         k = int(_np.searchsorted(_np.cumsum(probs), draw, side="right"))
         return int(idx[k]) if k < len(idx) else int(idx[-1])
 
@@ -3608,7 +3791,7 @@ class CudaRuntime:
             total = sum(probs)
             if total > 0:
                 probs = [p / total for p in probs]
-        stream = self._rng(spec.seed)
+        stream = self._rng(spec)
         draw = stream.random()
         acc = 0.0
         for (_, token), pr in zip(cand, probs):
@@ -3617,28 +3800,38 @@ class CudaRuntime:
                 return token
         return cand[-1][1]
 
-    def _rng(self, seed):
-        """The per-request draw stream, one generator per seed.
+    def _rng(self, spec):
+        """The request's draw stream: `random.Random(spec.seed)`, one per spec.
 
-        Streams are cached so one request's draws continue across its steps.
+        The engine hands every request a spec of its own (`request_spec`) and
+        the same one at each of its steps, so the spec OBJECT is the request:
+        its draws continue across its steps, and the next request that pins
+        the same seed starts the stream over -- the same seed, the same
+        output -- while two requests running at once never share one. (Keyed
+        by the seed's value instead, a second request continued the first
+        one's stream, and two at once interleaved their draws.) The entry
+        holds the spec, so its id cannot be reused while it is cached.
+
         When the cache is full the OLDEST stream goes (insertion order, so the
         live requests' streams are the last to be touched) -- never a blanket
         clear(): that restarted a concurrent request's stream mid-generation,
         and a restarted stream repeats its draws, which repeats its tokens.
         """
-        rng = self._streams.get(seed)
-        if rng is None:
+        key = id(spec)
+        entry = self._streams.get(key)
+        if entry is None or entry[0] is not spec:
+            self._streams.pop(key, None)
             while len(self._streams) >= 64:
                 self._streams.pop(next(iter(self._streams)))
-            rng = self._streams[seed] = random.Random(seed)
+            entry = self._streams[key] = (spec, random.Random(spec.seed))
         else:
             # refresh recency (true LRU). Without this a live generation's
             # stream sits at the FRONT of insertion order and is the first one
-            # evicted once 64 other seeds come and go -- and the restart re-
-            # draws the stream from the top, which repeats the tokens: the
+            # evicted once 64 other requests come and go -- and the restart
+            # re-draws the stream from the top, which repeats the tokens: the
             # loop this whole cache exists to avoid.
-            self._streams[seed] = self._streams.pop(seed)
-        return rng
+            self._streams[key] = self._streams.pop(key)
+        return entry[1]
 
 
 # ---------------------------------------------------------------------------
@@ -3670,6 +3863,18 @@ EXL3_PT_SHARE = 0.08       # ... and the share of the trellis read it may take
 # SM from this input width up -- down_proj, out_proj, o_proj measured 1.04-1.08x
 # there, the 5120-wide inputs 0.8-1.0x). ORCA_M3_ENTRY=0: the m-general entry.
 M3_ENTRY = int(__import__("os").environ.get("ORCA_M3_ENTRY", "1"))
+# a batched decode's groups of 2 and 4 rows on their own entries (exl3_gemv_w4a2fp /
+# w4a4fp and their multi-module twins); 0: the m-general entry and one launch a module
+ROWS_ENTRY = int(__import__("os").environ.get("ORCA_ROWS_ENTRY", "1"))
+# ... at 3 blocks an SM from this input width up (_build/bench_rows_entries.py,
+# paired: m = 2 down/out/o_proj 1.01-1.05x; m = 4 down_proj 1.10x, the 6144-wide
+# 0.99x). The multi-module launches lost at 3 an SM (0.7-0.96x) and keep 2.
+ROWS_OCC3_MIN_IN = {2: 6144, 4: 8192}
+ROWS_FPN_OCC3 = ()
+# The multi-module launch's partials capped by the `pt` arena itself rather than
+# EXL3_PT_BYTES, for the batched groups only: m = 4's gate + up (2 x 2.2 MB)
+# otherwise split into two launches, 687 -> 504 us a layer.
+ROWS_PT = 1
 # a decode step's projections of one input in one launch (exl3_gemv_w4a1fpn):
 # in_proj_qkv + in_proj_z, q/k/v_proj, gate + up_proj. ORCA_GEMV_N=0: one each.
 GEMV_N = int(__import__("os").environ.get("ORCA_GEMV_N", "1"))
@@ -3784,7 +3989,9 @@ KERNEL_X_NAMES = ("had128_pre", "had128_post", "exl3_gemv", "gemv_f16_f32",
                   "had128_post_sk", "exl3_gemv_w4a", "exl3_gemv_w4a1",
                   "exl3_gemv_w4a1f", "exl3_gemv_w4af", "exl3_gemv_w4a1fp",
                   "exl3_gemv_w4afp", "exl3_gemv_w4a3fp", "exl3_gemv_w4a3fp3", "exl3_gemv_w4a1fpn",
-                  "exl3_gemv_w4a3fpn",
+                  "exl3_gemv_w4a3fpn", "exl3_gemv_w4a2fp", "exl3_gemv_w4a4fp",
+                  "exl3_gemv_w4a2fpn", "exl3_gemv_w4a4fpn", "exl3_gemv_w4a2fp3",
+                  "exl3_gemv_w4a4fp3", "exl3_gemv_w4a2fpn3", "exl3_gemv_w4a4fpn3",
                   "exl3_cand_hist", "exl3_cand_sum", "exl3_cand_collect",
                   "exl3_argmax16_partial", "exl3_argmax16_final")
 

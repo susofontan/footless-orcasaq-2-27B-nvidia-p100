@@ -18,12 +18,12 @@ On a P100 you get:
 * about **20 tokens/s** of generation, and **~30 tokens/s with MTP speculative
   decoding**;
 * **~200 tokens/s** of prompt processing;
-* contexts up to **~100k tokens** (~80k with MTP).
+* contexts up to **~100k tokens** (~80k with MTP);
+* up to **4 requests at once**, ~44 tokens/s in total.
 
 > [!WARNING]
 > **Experimental.** footless is a young engine and this is its first packaged
-> release. The kernels exist for one GPU model only. The
-> server answers one request at a time, with no batching. Expect rough edges, and
+> release. The kernels exist for one GPU model only. Expect rough edges, and
 > do not use it where a failure would be costly.
 
 
@@ -286,8 +286,9 @@ unchanged.
 
 Things to know:
 
-* **One request at a time.** Requests queue in arrival order; there is no
-  batching.
+* **Several requests at once.** Up to 4 generate together, sharing each pass
+  over the weights; more wait in arrival order. Each answer is exactly the one
+  the request would get alone. See [Several requests at once](#several-requests-at-once).
 * **Thinking** is on by default, at the template's `xhigh` level. Choose the
   level with `reasoning_effort`: `"xhigh"`, `"medium"` or `"low"`. `"none"`
   turns thinking off. The thinking text comes back in the `reasoning` field,
@@ -530,6 +531,34 @@ every turn. The server keeps the processed conversation, and a follow-up turn
 only processes its new tokens: about 4 s for the next turn of a
 100k-token conversation.
 
+### Several requests at once
+
+Up to 4 requests generate together: each step reads the weights once for all
+of them, so the total rate grows while each request slows down. Measured over
+HTTP with `MTP=1`, 256 tokens a request, thinking off:
+
+| Requests at once | Total | Each request |
+| --- | --- | --- |
+| 1 | 29.7 tok/s | 29.7 tok/s |
+| 2 | 31.4 tok/s | 15.7 tok/s |
+| 3 | 39.3 tok/s | 13.1 tok/s |
+| 4 | 43.8 tok/s | 10.9 tok/s |
+
+Every answer is token for token the one the request gets alone, greedy or
+with a fixed `seed`. MTP speeds up a request only while it runs alone, which
+is why 2 at once gain little over 1.
+
+Prompts are processed one at a time. While others generate, a new prompt is
+processed in chunks of 1024 tokens, and the others pause for each chunk:
+about 5 s at a time. A 7k-token prompt that arrived while three requests were
+generating took 32 s to its first token, the same as alone.
+
+The requests share the memory of the context limits below. A request that
+does not fit waits until one ends; long prompts at once are therefore
+processed one after another. Decision requests run between generation steps
+and add no wait of their own: 0.9 s for two questions, measured while two
+requests were generating.
+
 ### Context limits
 
 | | Maximum context (one conversation) |
@@ -537,9 +566,9 @@ only processes its new tokens: about 4 s for the next turn of a
 | `MTP=0` | ~100k tokens (102,400) |
 | `MTP=1` | ~80k tokens |
 
-The limit counts the prompt and the generated tokens together. The KV cache is
-int8 at 34 KiB per token. These limits assume the card is used by nothing
-else.
+The limit counts the prompt and the generated tokens together, and requests
+running at once share it. The KV cache is int8 at 34 KiB per token. These
+limits assume the card is used by nothing else.
 
 A conversation that grows past the limit fails with HTTP 500 and the message
 `budget ... cannot admit ...`. A long prompt can fail only after it has been

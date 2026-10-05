@@ -27,8 +27,15 @@ from .sdk import (
 )
 
 CHUNK = 4096  # prefill is fed in chunks; only the last one samples
+# A prefill that shares its steps with other requests' decodes goes in chunks of
+# this many tokens instead: each of their tokens waits for one chunk.
+SHARED_CHUNK = 1024
 DEFAULT_BUDGET = 1 << 34
 DEFAULT_MAX_TOKENS = 16384
+# The room a request must find to be admitted beside others (Batcher): its
+# context's cache and this many tokens' worth more, for its state's fixed part
+# and its growth. Alone, a request is always admitted.
+ADMIT_HEADROOM = 8192
 
 # The repetition guard: how long a repeating tail may run before it is a loop.
 # A model that collapses repeats one span of tokens verbatim until the budget
@@ -311,6 +318,10 @@ class PrefixCache:
         self._runtime.truncate_state(state, best_len)
         return state, best_len
 
+    def nbytes(self) -> int:
+        """What the entries hold: room an eviction can give back."""
+        return sum(self._runtime.state_nbytes(state) for state in self._entries.values())
+
     def store(self, tokens: list[int], state: State) -> None:
         key = tuple(tokens)
         old = self._entries.pop(key, None)
@@ -416,6 +427,9 @@ class Engine:
         self.facts = facts
         self.services = services
         self.cache = cache
+        # set by a Batcher before it resumes its sequences: is more than one
+        # request admitted (a prefill then shares its steps; `sequence`)
+        self._sharing = False
 
     @classmethod
     def open(
@@ -643,8 +657,8 @@ class Engine:
         so far — including steps that sample nothing and stop tokens the
         engine's own rules keep out of the output — and returning `True` from it
         ends the generation: the caller's stop policy on top of the engine's.
-        `ctx` is the step context the model checks at step boundaries; a
-        cancelled one ends the request at the next step.
+        `ctx` is the step context, checked at step boundaries; a cancelled one
+        ends the request at the next step.
 
         `loop_guard` picks the engine's repetition rule (LOOP_GUARD_MODES):
         output that ends in one span repeated past the threshold ends the
@@ -655,13 +669,31 @@ class Engine:
         iterations -- a false positive there costs the rest of a healthy
         answer, so they run only when asked. "off" lets a collapse run to
         `max_tokens`. `True` / `False` mean "full" / "off".
+
+        The request runs alone: `sequence` driven by a `Batcher` of its own.
+        """
+        return Batcher(self).run(self.sequence(
+            tokens, max_tokens, on_token, sampling, on_step, ctx, loop_guard))
+
+    def sequence(
+        self, tokens: list[int], max_tokens: int = DEFAULT_MAX_TOKENS,
+        on_token=None, sampling: SamplingSpec | None = None,
+        on_step=None, ctx: StepContext | None = None, loop_guard: bool | str = "exact",
+    ):
+        """`generate_tokens` as a generator a `Batcher` drives beside others.
+
+        It yields what it needs -- `Admit` first (room for a state), then one
+        `Want` a step -- and is sent each step's `(StepResult, seconds)`; it
+        returns the `GenerationResult`. A `Preempted` thrown in at a step
+        boundary parks it: its state goes to the prefix cache, keyed on what
+        it holds, and once admitted again it continues from there -- the
+        prompt and the output so far, re-forwarding only what the cache lost.
         """
         mode = ("full" if loop_guard else "off") if isinstance(loop_guard, bool) \
             else loop_guard
         if mode not in LOOP_GUARD_MODES:
             raise ValueError(f"loop_guard {loop_guard!r}: one of {LOOP_GUARD_MODES}")
         rule = {"exact": loop_cut_exact, "full": loop_cut}.get(mode)
-        runtime = self.runtime
         if len(tokens) > self.facts.max_context:
             raise ContractError(
                 f"prompt is {len(tokens)} tokens, max_context is {self.facts.max_context}"
@@ -675,8 +707,6 @@ class Engine:
             raise BudgetRefused(
                 f"prompt is {len(tokens)} tokens: its cache needs {need} B, more than "
                 f"the whole budget of {budget} B")
-        state, matched = self.cache.lookup(tokens)
-        fed = tokens[matched:]
         ctx = ctx if ctx is not None else StepContext()
         # what a request does not pin runs under the package's own defaults
         # (Facts.default_sampling -- its generation config), and only where a
@@ -711,71 +741,84 @@ class Engine:
             if on_step is not None and on_step(step_result, timing):
                 finished = True
 
-        consumed = 0
-        try:
-            chunks = [fed[i : i + CHUNK] for i in range(0, len(fed), CHUNK)]
-            for index, chunk in enumerate(chunks):
-                last = index == len(chunks) - 1
-                # a step with no sampling spec samples nothing: max_tokens = 0 is
-                # exactly zero output, and chunks before the last one never sample
-                sample = spec if last and max_tokens > 0 else None
-                # only the step is timed: notify and bookkeeping wait outside, so
-                # a slow front end cannot be read as a slow model
-                started = time.perf_counter()
-                result = runtime.step([StepItem(state, chunk, sample)], ctx)[0]
-                elapsed = time.perf_counter() - started
-                absorb(result)
-                # book the tokens that ran, not the tokens the request fed: a
-                # truncate can queue the kept prefix for re-forwarding inside this
-                # step, and that work must not be read as the model slowing down
-                ran = result.forwarded_tokens or len(chunk)
-                timing.prefill_rates.add(ran, elapsed)
-                timing.prefill_seconds += elapsed
-                timing.prefill_tokens += ran
-                consumed += len(chunk)
-                if finished or (max_tokens > 0 and len(generated) >= max_tokens):
-                    break
+        consumed = 0                    # prompt tokens the first admission forwarded
+        first = True
+        while True:
+            # what the state must hold before the next sample: the prompt, then
+            # (after a preemption) the output so far
+            context = list(tokens) + generated
+            yield Admit(self.facts.cache_bytes_per_token * (len(context) + ADMIT_HEADROOM))
+            state, matched = self.cache.lookup(context)
+            fed = context[matched:]
+            taken = len(generated)          # output this admission adds is past here
+            at = 0                          # of `fed`, forwarded so far
+            try:
+                while at < len(fed):
+                    # a prefill shares its steps with other requests' decodes in
+                    # smaller chunks: each of their tokens waits for one chunk
+                    size = SHARED_CHUNK if self._sharing else CHUNK
+                    chunk = fed[at:at + size]
+                    last = at + len(chunk) == len(fed)
+                    # a step with no sampling spec samples nothing: max_tokens = 0
+                    # is exactly zero output, and chunks before the last one never
+                    # sample
+                    sample = spec if last and max_tokens > len(generated) else None
+                    result, elapsed = yield Want(StepItem(state, chunk, sample), ctx)
+                    absorb(result)
+                    # book the tokens that ran, not the tokens the request fed: a
+                    # truncate can queue the kept prefix for re-forwarding inside
+                    # this step, and that work must not be read as the model
+                    # slowing down
+                    ran = result.forwarded_tokens or len(chunk)
+                    timing.prefill_rates.add(ran, elapsed)
+                    timing.prefill_seconds += elapsed
+                    timing.prefill_tokens += ran
+                    at += len(chunk)
+                    if first:
+                        consumed = at
+                    if finished or (max_tokens > 0 and len(generated) >= max_tokens):
+                        break
 
-            while not finished and len(generated) < max_tokens:
-                before = len(generated)
-                started = time.perf_counter()
-                result = runtime.step([StepItem(state, [], spec)], ctx)[0]
-                elapsed = time.perf_counter() - started
-                absorb(result)
-                produced = len(generated) - before
-                if produced:  # a step that sampled no output is not a decode speed
-                    timing.decode_tokens += produced
-                    timing.decode_seconds += elapsed
-                    # ...and neither is a step that returned a token it had already
-                    # computed. A model that verifies a draft hands the second token
-                    # out on the next step with no forward at all; that step takes
-                    # microseconds, so as a rate sample it reads in the tens of
-                    # thousands and takes the phase's mean and max with it. The
-                    # token and the time still count -- the aggregate is right --
-                    # but it is not a sample of how fast a forward runs.
-                    if result.forwarded:
-                        timing.decode_rates.add(produced, elapsed)
-
-        except BaseException:
-            # a refused allocation, a cancelled or failed step: the state is
-            # this request's alone, and nothing else would ever free it
-            runtime.free_state(state)
-            raise
+                while not finished and len(generated) < max_tokens:
+                    before = len(generated)
+                    result, elapsed = yield Want(StepItem(state, [], spec), ctx)
+                    absorb(result)
+                    produced = len(generated) - before
+                    if produced:  # a step that sampled no output is not a decode speed
+                        timing.decode_tokens += produced
+                        timing.decode_seconds += elapsed
+                        # ...and neither is a step that returned a token it had
+                        # already computed. A model that verifies a draft hands
+                        # the second token out on the next step with no forward
+                        # at all; that step takes microseconds, so as a rate
+                        # sample it reads in the tens of thousands and takes the
+                        # phase's mean and max with it. The token and the time
+                        # still count -- the aggregate is right -- but it is not
+                        # a sample of how fast a forward runs.
+                        if result.forwarded:
+                            timing.decode_rates.add(produced, elapsed)
+            except Preempted:
+                # the batch needs this request's room: its state waits in the
+                # prefix cache (evictable like any entry) for its next turn
+                self.cache.store(context[:matched + at] + generated[taken:], state)
+                first = False
+                continue
+            except BaseException:
+                # a refused allocation, a cancelled or failed step: the state is
+                # this request's alone, and nothing else would ever free it
+                self.runtime.free_state(state)
+                raise
+            break
         timing.total_seconds = time.perf_counter() - t_start
         result_tokens = generated if cut is None else generated[:cut]
-        text = runtime.decode(result_tokens)
+        text = self.runtime.decode(result_tokens)
         # the cache entry is keyed on what the state actually saw — including
         # tokens the guard later trimmed, which the state absorbed all the
         # same. An early end may also have left part of the prompt unfed.
-        if __import__("os").environ.get("FOOTLESS_DEBUG"):
-            import sys as _s
-            print(f"[dbg eng] matched={matched} consumed={consumed} "
-                  f"req={len(tokens)} gen={len(generated)} result_eq_gen="
-                  f"{result_tokens == generated} cut={cut}", file=_s.stderr)
-        # the request is done with its state: the cache keeps it as is (a
-        # copy would need the room of a second one, which a long
-        # conversation's state does not leave)
-        self.cache.store(tokens[: matched + consumed] + generated, state)
+        # The request is done with its state: the cache keeps it as is (a copy
+        # would need the room of a second one, which a long conversation's
+        # state does not leave)
+        self.cache.store(context[:matched + at] + generated[taken:], state)
         return GenerationResult(text, result_tokens, consumed, finished, timing,
                                 looped=cut is not None, absorbed_tokens=generated)
 
@@ -790,6 +833,153 @@ class Engine:
             return True
         generated.append(result.token)
         return False
+
+
+@dataclass
+class Admit:
+    """A sequence asks to be admitted: room for `nbytes` of state."""
+
+    nbytes: int
+
+
+@dataclass
+class Want:
+    """A sequence's item for the next step, and the context that may cancel it."""
+
+    item: StepItem
+    ctx: StepContext
+
+
+class Preempted(Exception):
+    """Thrown into a sequence the step has no room for (`Engine.sequence`)."""
+
+
+class _Task:
+    """One driven generator: what it waits for, and how it ended."""
+
+    __slots__ = ("gen", "want", "admitted", "done", "result", "error", "order")
+
+    def __init__(self, gen, order: int) -> None:
+        self.gen = gen
+        self.want = None
+        self.admitted = False
+        self.done = False
+        self.result = None
+        self.error: BaseException | None = None
+        self.order = order
+
+
+class Batcher:
+    """Several requests' steps as one: the engine's scheduling policy.
+
+    A task is a generator that yields what `Engine.sequence` yields (it may be
+    one, or one that delegates to it with `yield from`). Tasks are admitted in
+    arrival order while fewer than the package's `max_batch` are, and -- beside
+    others -- while the budget has room for what they ask (`Admit`: the ledger's
+    free bytes and what the prefix cache could give back). Each `step` runs ONE
+    runtime step over the admitted tasks: every decode, and at most one prefill
+    chunk (the oldest request's). A task cancelled at a step boundary is ended
+    there without the model. A step the budget refuses runs again without its
+    youngest task, which is preempted and admitted again later; alone, a
+    refusal is the task's error, as it always was.
+    """
+
+    def __init__(self, engine: "Engine") -> None:
+        self.engine = engine
+        self.tasks: list[_Task] = []
+        self._order = 0
+
+    def add(self, gen) -> _Task:
+        task = _Task(gen, self._order)
+        self._order += 1
+        self.tasks.append(task)
+        self._advance(task)
+        return task
+
+    def busy(self) -> bool:
+        return bool(self.tasks)
+
+    def run(self, gen):
+        """One task, alone, to its end: its return value, or its error raised."""
+        task = self.add(gen)
+        while not task.done:
+            self.step()
+        if task.error is not None:
+            raise task.error
+        return task.result
+
+    def _advance(self, task: _Task, value=None, throw: BaseException | None = None) -> None:
+        try:
+            if throw is not None:
+                task.want = task.gen.throw(throw)
+            elif task.want is None:
+                task.want = next(task.gen)
+            else:
+                task.want = task.gen.send(value)
+        except StopIteration as stop:
+            task.done, task.result = True, stop.value
+        except Exception as exc:  # noqa: BLE001 - the task's own failure, reported
+            task.done, task.error = True, exc
+        else:
+            # admission is a sequence's: a task that runs several in turn (a
+            # request's choices) asks again for each
+            if isinstance(task.want, Admit):
+                task.admitted = False
+
+    def _room(self) -> int:
+        return self.engine.services.accounting.available() + self.engine.cache.nbytes()
+
+    def step(self) -> list[_Task]:
+        """Admit what fits, run one step, and return the tasks that ended."""
+        engine = self.engine
+        live = [t for t in self.tasks if t.admitted and not t.done]
+        for task in self.tasks:
+            if task.done or task.admitted or not isinstance(task.want, Admit):
+                continue
+            if len(live) >= engine.facts.max_batch or \
+                    (live and task.want.nbytes > self._room()):
+                break                   # arrival order: nobody overtakes the head
+            task.admitted = True
+            live.append(task)
+            engine._sharing = len(live) > 1
+            self._advance(task)
+        engine._sharing = len(live) > 1
+        ready = [t for t in live if not t.done and isinstance(t.want, Want)]
+        stepping = []
+        for task in ready:
+            if task.want.ctx.cancelled():
+                # the runtime's own answer to a cancelled item, without the model
+                self._advance(task, (StepResult(None, True), 0.0))
+            else:
+                stepping.append(task)
+        decodes = [t for t in stepping if not t.want.item.input_tokens]
+        prefills = [t for t in stepping if t.want.item.input_tokens]
+        batch = decodes + prefills[:1]
+        while batch:
+            try:
+                started = time.perf_counter()
+                results = engine.runtime.step([t.want.item for t in batch], StepContext())
+                elapsed = time.perf_counter() - started
+            except BudgetRefused as exc:
+                if len(batch) == 1:
+                    self._advance(batch[0], throw=exc)
+                    break
+                victim = max(batch, key=lambda t: t.order)
+                batch.remove(victim)
+                self._advance(victim, throw=Preempted())
+                engine.services.log("info", "budget refused a step: the youngest "
+                                            "request waits for room")
+                continue
+            except Exception as exc:  # noqa: BLE001 - whose item failed is unknown
+                for task in batch:
+                    self._advance(task, throw=exc)
+                break
+            for task, result in zip(batch, results):
+                self._advance(task, (result, elapsed))
+            break
+        ended = [t for t in self.tasks if t.done]
+        self.tasks = [t for t in self.tasks if not t.done]
+        return ended
 
 
 def load_runtime(path: Path) -> Runtime:
